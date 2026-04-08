@@ -28,10 +28,11 @@
 不用克隆仓库, 从 NPM 下载后, 直接使用
 
 ```sh
-bun  i -g claude-code-best
-bun pm -g trust claude-code-best
-ccb # 直接打开 claude code
+npm i -g @rainhole/rain-code
+rain-code # 直接打开 rain-code
 ```
+
+从 `@rainhole/rain-code@2.0.0` 开始，这个包只安装 `rain-code` 命令，不再附带 `ccb` 和 `claude-code-best` 别名。
 
 ⚠️ 国内对 github 网络较差的, 需要先设置这个环境变量
 

@@ -1,6 +1,6 @@
 {
   "name": "@rainhole/rain-code",
-  "version": "1.1.0",
+  "version": "2.0.0",
   "description": "Reverse-engineered Anthropic Claude Code CLI — interactive AI coding assistant in the terminal",
   "type": "module",
   "author": "rainhole",
@@ -25,9 +25,7 @@
     "bun": ">=1.2.0"
   },
   "bin": {
-    "rain-code": "dist/cli.js",
-    "ccb": "dist/cli.js",
-    "claude-code-best": "dist/cli.js"
+    "rain-code": "dist/cli.js"
   },
   "publishConfig": {
     "access": "public"
