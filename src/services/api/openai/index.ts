@@ -1,24 +1,185 @@
 import type { BetaToolUnion } from '@anthropic-ai/sdk/resources/beta/messages/messages.mjs'
+import type { ChatCompletionCreateParamsStreaming } from 'openai/resources/chat/completions/completions.mjs'
 import type { SystemPrompt } from '../../../utils/systemPromptType.js'
-import type { Message, StreamEvent, SystemAPIErrorMessage, AssistantMessage } from '../../../types/message.js'
+import type {
+  Message,
+  StreamEvent,
+  SystemAPIErrorMessage,
+  AssistantMessage,
+} from '../../../types/message.js'
 import type { Tools } from '../../../Tool.js'
 import { getOpenAIClient } from './client.js'
 import { anthropicMessagesToOpenAI } from './convertMessages.js'
-import { anthropicToolsToOpenAI, anthropicToolChoiceToOpenAI } from './convertTools.js'
+import {
+  anthropicToolsToOpenAI,
+  anthropicToolChoiceToOpenAI,
+} from './convertTools.js'
 import { adaptOpenAIStreamToAnthropic } from './streamAdapter.js'
 import { resolveOpenAIModel } from './modelMapping.js'
-import { normalizeMessagesForAPI } from '../../../utils/messages.js'
+import {
+  createAssistantAPIErrorMessage,
+  normalizeContentFromAPI,
+  normalizeMessagesForAPI,
+} from '../../../utils/messages.js'
 import { toolToAPISchema } from '../../../utils/api.js'
 import { getEmptyToolPermissionContext } from '../../../Tool.js'
 import { logForDebugging } from '../../../utils/debug.js'
 import { addToTotalSessionCost } from '../../../cost-tracker.js'
 import { calculateUSDCost } from '../../../utils/modelCost.js'
+import { getModelMaxOutputTokens } from '../../../utils/context.js'
+import { validateBoundedIntEnvVar } from '../../../utils/envValidation.js'
 import type { Options } from '../claude.js'
 import { randomUUID } from 'crypto'
-import {
-  createAssistantAPIErrorMessage,
-  normalizeContentFromAPI,
-} from '../../../utils/messages.js'
+import { API_ERROR_MESSAGE_PREFIX } from '../errors.js'
+
+type OpenAIMaxTokensParam = 'max_completion_tokens' | 'max_tokens'
+type OpenAIUsage = {
+  input_tokens: number
+  output_tokens: number
+  cache_creation_input_tokens: number
+  cache_read_input_tokens: number
+}
+
+export function getOpenAIMaxOutputTokens(options: Options): number {
+  if (options.maxOutputTokensOverride !== undefined) {
+    return options.maxOutputTokensOverride
+  }
+
+  const maxOutputTokens = getModelMaxOutputTokens(options.model)
+  return validateBoundedIntEnvVar(
+    'CLAUDE_CODE_MAX_OUTPUT_TOKENS',
+    process.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS,
+    maxOutputTokens.default,
+    maxOutputTokens.upperLimit,
+  ).effective
+}
+
+export function prefersMaxCompletionTokens(model: string): boolean {
+  return /^(o\d|gpt-5(?:-|$))/i.test(model)
+}
+
+export function shouldRetryWithAlternateMaxTokensParam(
+  error: unknown,
+  attemptedParam: OpenAIMaxTokensParam,
+): boolean {
+  const message = (
+    error instanceof Error ? error.message : String(error)
+  ).toLowerCase()
+
+  if (attemptedParam === 'max_tokens') {
+    return (
+      message.includes('max_tokens') &&
+      (message.includes('max_completion_tokens') ||
+        message.includes('o-series') ||
+        message.includes('reasoning model') ||
+        message.includes('incompatible'))
+    )
+  }
+
+  return (
+    message.includes('max_completion_tokens') &&
+    (message.includes('unsupported') ||
+      message.includes('unknown') ||
+      message.includes('unrecognized') ||
+      message.includes('extra inputs') ||
+      message.includes('not allowed') ||
+      message.includes('not permitted'))
+  )
+}
+
+export async function createOpenAIStream(
+  client: ReturnType<typeof getOpenAIClient>,
+  requestBase: Omit<
+    ChatCompletionCreateParamsStreaming,
+    'max_completion_tokens' | 'max_tokens'
+  >,
+  maxOutputTokens: number,
+  signal: AbortSignal,
+  model: string,
+) {
+  let tokenLimitParam: OpenAIMaxTokensParam = prefersMaxCompletionTokens(model)
+    ? 'max_completion_tokens'
+    : 'max_tokens'
+
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const requestParams = {
+      ...requestBase,
+      [tokenLimitParam]: maxOutputTokens,
+    } as ChatCompletionCreateParamsStreaming
+
+    try {
+      return await client.chat.completions.create(requestParams, {
+        signal,
+      })
+    } catch (error) {
+      if (
+        attempt === 0 &&
+        shouldRetryWithAlternateMaxTokensParam(error, tokenLimitParam)
+      ) {
+        const retryParam: OpenAIMaxTokensParam =
+          tokenLimitParam === 'max_tokens'
+            ? 'max_completion_tokens'
+            : 'max_tokens'
+        logForDebugging(
+          `[OpenAI] Retrying model=${model} with ${retryParam} after ${tokenLimitParam} was rejected`,
+        )
+        tokenLimitParam = retryParam
+        continue
+      }
+      throw error
+    }
+  }
+
+  throw new Error('OpenAI stream creation exhausted retries unexpectedly')
+}
+
+export function applyOpenAIMessageDelta(params: {
+  event: {
+    delta?: { stop_reason?: string | null }
+    usage?: Partial<OpenAIUsage>
+  }
+  usage: OpenAIUsage
+  newMessages: AssistantMessage[]
+  maxOutputTokens: number
+  emittedMaxTokensError: boolean
+}): {
+  usage: OpenAIUsage
+  emittedMaxTokensError: boolean
+  syntheticError?: SystemAPIErrorMessage
+} {
+  const nextUsage = params.event.usage
+    ? { ...params.usage, ...params.event.usage }
+    : params.usage
+  const stopReason = params.event.delta?.stop_reason
+  const lastMsg = params.newMessages.at(-1)
+
+  if (lastMsg) {
+    lastMsg.message.usage = nextUsage as typeof lastMsg.message.usage
+    if (stopReason !== undefined) {
+      lastMsg.message.stop_reason = stopReason
+    }
+  }
+
+  if (stopReason === 'max_tokens' && !params.emittedMaxTokensError) {
+    return {
+      usage: nextUsage,
+      emittedMaxTokensError: true,
+      syntheticError: createAssistantAPIErrorMessage({
+        content:
+          `${API_ERROR_MESSAGE_PREFIX}: The model response exceeded the ` +
+          `${params.maxOutputTokens} output token maximum. To configure this behavior, ` +
+          `set the CLAUDE_CODE_MAX_OUTPUT_TOKENS environment variable.`,
+        apiError: 'max_output_tokens',
+        error: 'max_output_tokens',
+      }),
+    }
+  }
+
+  return {
+    usage: nextUsage,
+    emittedMaxTokensError: params.emittedMaxTokensError,
+  }
+}
 
 /**
  * OpenAI-compatible query path. Converts Anthropic-format messages/tools to
@@ -59,14 +220,20 @@ export async function* queryModelOpenAI(
     const standardTools = toolSchemas.filter(
       (t): t is BetaToolUnion & { type: string } => {
         const anyT = t as Record<string, unknown>
-        return anyT.type !== 'advisor_20260301' && anyT.type !== 'computer_20250124'
+        return (
+          anyT.type !== 'advisor_20260301' && anyT.type !== 'computer_20250124'
+        )
       },
     )
 
     // 4. Convert messages and tools to OpenAI format
-    const openaiMessages = anthropicMessagesToOpenAI(messagesForAPI, systemPrompt)
+    const openaiMessages = anthropicMessagesToOpenAI(
+      messagesForAPI,
+      systemPrompt,
+    )
     const openaiTools = anthropicToolsToOpenAI(standardTools)
     const openaiToolChoice = anthropicToolChoiceToOpenAI(options.toolChoice)
+    const maxOutputTokens = getOpenAIMaxOutputTokens(options)
 
     // 5. Get client and make streaming request
     const client = getOpenAIClient({
@@ -75,26 +242,34 @@ export async function* queryModelOpenAI(
       source: options.querySource,
     })
 
-    logForDebugging(`[OpenAI] Calling model=${openaiModel}, messages=${openaiMessages.length}, tools=${openaiTools.length}`)
+    logForDebugging(
+      `[OpenAI] Calling model=${openaiModel}, messages=${openaiMessages.length}, tools=${openaiTools.length}`,
+    )
 
     // 6. Call OpenAI API with streaming
-    const stream = await client.chat.completions.create(
-      {
-        model: openaiModel,
-        messages: openaiMessages,
-        ...(openaiTools.length > 0 && {
-          tools: openaiTools,
-          ...(openaiToolChoice && { tool_choice: openaiToolChoice }),
-        }),
-        stream: true,
-        stream_options: { include_usage: true },
-        ...(options.temperatureOverride !== undefined && {
-          temperature: options.temperatureOverride,
-        }),
-      },
-      {
-        signal,
-      },
+    const requestBase = {
+      model: openaiModel,
+      messages: openaiMessages,
+      ...(openaiTools.length > 0 && {
+        tools: openaiTools,
+        ...(openaiToolChoice && { tool_choice: openaiToolChoice }),
+      }),
+      stream: true,
+      stream_options: { include_usage: true },
+      ...(options.temperatureOverride !== undefined && {
+        temperature: options.temperatureOverride,
+      }),
+    } as Omit<
+      ChatCompletionCreateParamsStreaming,
+      'max_completion_tokens' | 'max_tokens'
+    >
+
+    const stream = await createOpenAIStream(
+      client,
+      requestBase,
+      maxOutputTokens,
+      signal,
+      openaiModel,
     )
 
     // 7. Convert OpenAI stream to Anthropic events, then process into
@@ -103,13 +278,15 @@ export async function* queryModelOpenAI(
 
     // Accumulate content blocks and usage, same as the Anthropic path in claude.ts
     const contentBlocks: Record<number, any> = {}
-    let partialMessage: any = undefined
-    let usage = {
+    const newMessages: AssistantMessage[] = []
+    let partialMessage: any
+    let usage: OpenAIUsage = {
       input_tokens: 0,
       output_tokens: 0,
       cache_creation_input_tokens: 0,
       cache_read_input_tokens: 0,
     }
+    let emittedMaxTokensError = false
     let ttftMs = 0
     const start = Date.now()
 
@@ -121,7 +298,7 @@ export async function* queryModelOpenAI(
           if ((event as any).message?.usage) {
             usage = {
               ...usage,
-              ...((event as any).message.usage),
+              ...(event as any).message.usage,
             }
           }
           break
@@ -164,27 +341,33 @@ export async function* queryModelOpenAI(
           const m: AssistantMessage = {
             message: {
               ...partialMessage,
-              content: normalizeContentFromAPI(
-                [block],
-                tools,
-                options.agentId,
-              ),
+              content: normalizeContentFromAPI([block], tools, options.agentId),
             },
             requestId: undefined,
             type: 'assistant',
             uuid: randomUUID(),
             timestamp: new Date().toISOString(),
           }
+          newMessages.push(m)
           yield m
           break
         }
         case 'message_delta': {
-          const deltaUsage = (event as any).usage
-          if (deltaUsage) {
-            usage = { ...usage, ...deltaUsage }
+          const deltaResult = applyOpenAIMessageDelta({
+            event: event as {
+              delta?: { stop_reason?: string | null }
+              usage?: Partial<OpenAIUsage>
+            },
+            usage,
+            newMessages,
+            maxOutputTokens,
+            emittedMaxTokensError,
+          })
+          usage = deltaResult.usage
+          emittedMaxTokensError = deltaResult.emittedMaxTokensError
+          if (deltaResult.syntheticError) {
+            yield deltaResult.syntheticError
           }
-          // Update the stop_reason on the last yielded message
-          // (we don't have a reference here, but the consumer handles this)
           break
         }
         case 'message_stop':
@@ -192,7 +375,10 @@ export async function* queryModelOpenAI(
       }
 
       // Track cost and token usage (matching the Anthropic path in claude.ts)
-      if (event.type === 'message_stop' && usage.input_tokens + usage.output_tokens > 0) {
+      if (
+        event.type === 'message_stop' &&
+        usage.input_tokens + usage.output_tokens > 0
+      ) {
         const costUSD = calculateUSDCost(openaiModel, usage as any)
         addToTotalSessionCost(costUSD, usage as any, options.model)
       }

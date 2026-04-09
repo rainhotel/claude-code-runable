@@ -30,10 +30,14 @@ export async function* adaptOpenAIStreamToAnthropic(
   const messageId = `msg_${randomUUID().replace(/-/g, '').slice(0, 24)}`
 
   let started = false
+  let stopped = false
   let currentContentIndex = -1
 
   // Track tool_use blocks: tool_calls index → { contentIndex, id, name, arguments }
-  const toolBlocks = new Map<number, { contentIndex: number; id: string; name: string; arguments: string }>()
+  const toolBlocks = new Map<
+    number,
+    { contentIndex: number; id: string; name: string; arguments: string }
+  >()
 
   // Track thinking block state
   let thinkingBlockOpen = false
@@ -88,82 +92,41 @@ export async function* adaptOpenAIStreamToAnthropic(
       } as BetaRawMessageStreamEvent
     }
 
-    if (!delta) continue
+    if (delta) {
+      // Handle reasoning_content → Anthropic thinking block
+      // DeepSeek and compatible providers send delta.reasoning_content
+      const reasoningContent = (delta as any).reasoning_content
+      if (reasoningContent != null && reasoningContent !== '') {
+        if (!thinkingBlockOpen) {
+          currentContentIndex++
+          thinkingBlockOpen = true
+          openBlockIndices.add(currentContentIndex)
 
-    // Handle reasoning_content → Anthropic thinking block
-    // DeepSeek and compatible providers send delta.reasoning_content
-    const reasoningContent = (delta as any).reasoning_content
-    if (reasoningContent != null && reasoningContent !== '') {
-      if (!thinkingBlockOpen) {
-        currentContentIndex++
-        thinkingBlockOpen = true
-        openBlockIndices.add(currentContentIndex)
-
-        yield {
-          type: 'content_block_start',
-          index: currentContentIndex,
-          content_block: {
-            type: 'thinking',
-            thinking: '',
-            signature: '',
-          },
-        } as BetaRawMessageStreamEvent
-      }
-
-      yield {
-        type: 'content_block_delta',
-        index: currentContentIndex,
-        delta: {
-          type: 'thinking_delta',
-          thinking: reasoningContent,
-        },
-      } as BetaRawMessageStreamEvent
-    }
-
-    // Handle text content
-    if (delta.content != null && delta.content !== '') {
-      if (!textBlockOpen) {
-        // Close thinking block if still open (reasoning done, now generating answer)
-        if (thinkingBlockOpen) {
           yield {
-            type: 'content_block_stop',
+            type: 'content_block_start',
             index: currentContentIndex,
+            content_block: {
+              type: 'thinking',
+              thinking: '',
+              signature: '',
+            },
           } as BetaRawMessageStreamEvent
-          openBlockIndices.delete(currentContentIndex)
-          thinkingBlockOpen = false
         }
 
-        currentContentIndex++
-        textBlockOpen = true
-        openBlockIndices.add(currentContentIndex)
-
         yield {
-          type: 'content_block_start',
+          type: 'content_block_delta',
           index: currentContentIndex,
-          content_block: {
-            type: 'text',
-            text: '',
+          delta: {
+            type: 'thinking_delta',
+            thinking: reasoningContent,
           },
         } as BetaRawMessageStreamEvent
       }
 
-      yield {
-        type: 'content_block_delta',
-        index: currentContentIndex,
-        delta: {
-          type: 'text_delta',
-          text: delta.content,
-        },
-      } as BetaRawMessageStreamEvent
-    }
-
-    // Handle tool calls
-    if (delta.tool_calls) {
-      for (const tc of delta.tool_calls) {
-        const tcIndex = tc.index
-
-        if (!toolBlocks.has(tcIndex)) {
-          // Close thinking block if open
+      // Handle text content
+      if (delta.content != null && delta.content !== '') {
+        if (!textBlockOpen) {
+          // Close thinking block if still open (reasoning done, now generating answer)
           if (thinkingBlockOpen) {
             yield {
               type: 'content_block_stop',
@@ -173,53 +136,95 @@ export async function* adaptOpenAIStreamToAnthropic(
             thinkingBlockOpen = false
           }
 
-          // Close text block if open
-          if (textBlockOpen) {
-            yield {
-              type: 'content_block_stop',
-              index: currentContentIndex,
-            } as BetaRawMessageStreamEvent
-            openBlockIndices.delete(currentContentIndex)
-            textBlockOpen = false
-          }
-
-          // Start new tool_use block
           currentContentIndex++
-          const toolId = tc.id || `toolu_${randomUUID().replace(/-/g, '').slice(0, 24)}`
-          const toolName = tc.function?.name || ''
-
-          toolBlocks.set(tcIndex, {
-            contentIndex: currentContentIndex,
-            id: toolId,
-            name: toolName,
-            arguments: '',
-          })
+          textBlockOpen = true
           openBlockIndices.add(currentContentIndex)
 
           yield {
             type: 'content_block_start',
             index: currentContentIndex,
             content_block: {
-              type: 'tool_use',
-              id: toolId,
-              name: toolName,
-              input: {},
+              type: 'text',
+              text: '',
             },
           } as BetaRawMessageStreamEvent
         }
 
-        // Stream argument fragments
-        const argFragment = tc.function?.arguments
-        if (argFragment) {
-          toolBlocks.get(tcIndex)!.arguments += argFragment
-          yield {
-            type: 'content_block_delta',
-            index: toolBlocks.get(tcIndex)!.contentIndex,
-            delta: {
-              type: 'input_json_delta',
-              partial_json: argFragment,
-            },
-          } as BetaRawMessageStreamEvent
+        yield {
+          type: 'content_block_delta',
+          index: currentContentIndex,
+          delta: {
+            type: 'text_delta',
+            text: delta.content,
+          },
+        } as BetaRawMessageStreamEvent
+      }
+
+      // Handle tool calls
+      if (delta.tool_calls) {
+        for (const tc of delta.tool_calls) {
+          const tcIndex = tc.index
+
+          if (!toolBlocks.has(tcIndex)) {
+            // Close thinking block if open
+            if (thinkingBlockOpen) {
+              yield {
+                type: 'content_block_stop',
+                index: currentContentIndex,
+              } as BetaRawMessageStreamEvent
+              openBlockIndices.delete(currentContentIndex)
+              thinkingBlockOpen = false
+            }
+
+            // Close text block if open
+            if (textBlockOpen) {
+              yield {
+                type: 'content_block_stop',
+                index: currentContentIndex,
+              } as BetaRawMessageStreamEvent
+              openBlockIndices.delete(currentContentIndex)
+              textBlockOpen = false
+            }
+
+            // Start new tool_use block
+            currentContentIndex++
+            const toolId =
+              tc.id || `toolu_${randomUUID().replace(/-/g, '').slice(0, 24)}`
+            const toolName = tc.function?.name || ''
+
+            toolBlocks.set(tcIndex, {
+              contentIndex: currentContentIndex,
+              id: toolId,
+              name: toolName,
+              arguments: '',
+            })
+            openBlockIndices.add(currentContentIndex)
+
+            yield {
+              type: 'content_block_start',
+              index: currentContentIndex,
+              content_block: {
+                type: 'tool_use',
+                id: toolId,
+                name: toolName,
+                input: {},
+              },
+            } as BetaRawMessageStreamEvent
+          }
+
+          // Stream argument fragments
+          const argFragment = tc.function?.arguments
+          if (argFragment) {
+            toolBlocks.get(tcIndex)!.arguments += argFragment
+            yield {
+              type: 'content_block_delta',
+              index: toolBlocks.get(tcIndex)!.contentIndex,
+              delta: {
+                type: 'input_json_delta',
+                partial_json: argFragment,
+              },
+            } as BetaRawMessageStreamEvent
+          }
         }
       }
     }
@@ -262,7 +267,9 @@ export async function* adaptOpenAIStreamToAnthropic(
       // force "tool_use" when we saw any tool blocks to ensure the query
       // loop actually executes the tools.
       const hasToolCalls = toolBlocks.size > 0
-      const stopReason = hasToolCalls ? 'tool_use' : mapFinishReason(choice.finish_reason)
+      const stopReason = hasToolCalls
+        ? 'tool_use'
+        : mapFinishReason(choice.finish_reason)
 
       yield {
         type: 'message_delta',
@@ -278,6 +285,7 @@ export async function* adaptOpenAIStreamToAnthropic(
       yield {
         type: 'message_stop',
       } as BetaRawMessageStreamEvent
+      stopped = true
     }
   }
 
@@ -286,6 +294,23 @@ export async function* adaptOpenAIStreamToAnthropic(
     yield {
       type: 'content_block_stop',
       index: idx,
+    } as BetaRawMessageStreamEvent
+  }
+
+  if (started && !stopped) {
+    yield {
+      type: 'message_delta',
+      delta: {
+        stop_reason: toolBlocks.size > 0 ? 'tool_use' : 'end_turn',
+        stop_sequence: null,
+      },
+      usage: {
+        output_tokens: outputTokens,
+      },
+    } as BetaRawMessageStreamEvent
+
+    yield {
+      type: 'message_stop',
     } as BetaRawMessageStreamEvent
   }
 }
