@@ -5,7 +5,7 @@ import { feature } from 'bun:bundle'
 // This happens when running cli.tsx directly (not via `bun run dev` or built dist/).
 if (typeof globalThis.MACRO === 'undefined') {
   ;(globalThis as any).MACRO = {
-    VERSION: process.env.CLAUDE_CODE_VERSION || '2.1.888',
+    VERSION: process.env.CLAUDE_CODE_VERSION || '1.0.2',
     BUILD_TIME: new Date().toISOString(),
     FEEDBACK_CHANNEL: '',
     ISSUES_EXPLAINER: '',
@@ -65,7 +65,7 @@ async function main(): Promise<void> {
   ) {
     // MACRO.VERSION is inlined at build time
     // biome-ignore lint/suspicious/noConsole:: intentional console output
-    console.log(`${MACRO.VERSION} (Claude Code)`)
+    console.log(`${MACRO.VERSION} (Rain Code)`)
     return
   }
 
