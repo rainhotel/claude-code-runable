@@ -144,11 +144,7 @@ export async function countMessagesTokensWithAPI(
   return withTokenCountVCR(messages, tools, async () => {
     try {
       const provider = getAPIProvider()
-      if (
-        provider === 'gemini' ||
-        provider === 'openai' ||
-        provider === 'grok'
-      ) {
+      if (provider === 'gemini') {
         return roughTokenCountEstimationForAPIRequest(messages, tools)
       }
 
@@ -262,7 +258,7 @@ export async function countTokensViaHaikuFallback(
   tools: Anthropic.Beta.Messages.BetaToolUnion[],
 ): Promise<number | null> {
   const provider = getAPIProvider()
-  if (provider === 'gemini' || provider === 'openai' || provider === 'grok') {
+  if (provider === 'gemini') {
     return roughTokenCountEstimationForAPIRequest(messages, tools)
   }
 

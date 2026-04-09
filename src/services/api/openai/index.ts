@@ -16,21 +16,33 @@ import {
 } from './convertTools.js'
 import { adaptOpenAIStreamToAnthropic } from './streamAdapter.js'
 import { resolveOpenAIModel } from './modelMapping.js'
+import { normalizeMessagesForAPI } from '../../../utils/messages.js'
+import { toolToAPISchema } from '../../../utils/api.js'
+import {
+  getEmptyToolPermissionContext,
+  toolMatchesName,
+} from '../../../Tool.js'
+import { logForDebugging } from '../../../utils/debug.js'
+import { getModelMaxOutputTokens } from '../../../utils/context.js'
+import { addToTotalSessionCost } from '../../../cost-tracker.js'
+import { calculateUSDCost } from '../../../utils/modelCost.js'
+import { validateBoundedIntEnvVar } from '../../../utils/envValidation.js'
+import { isEnvTruthy, isEnvDefinedFalsy } from '../../../utils/envUtils.js'
+import type { Options } from '../claude.js'
+import { randomUUID } from 'crypto'
 import {
   createAssistantAPIErrorMessage,
   normalizeContentFromAPI,
-  normalizeMessagesForAPI,
 } from '../../../utils/messages.js'
-import { toolToAPISchema } from '../../../utils/api.js'
-import { getEmptyToolPermissionContext } from '../../../Tool.js'
-import { logForDebugging } from '../../../utils/debug.js'
-import { addToTotalSessionCost } from '../../../cost-tracker.js'
-import { calculateUSDCost } from '../../../utils/modelCost.js'
-import { getModelMaxOutputTokens } from '../../../utils/context.js'
-import { validateBoundedIntEnvVar } from '../../../utils/envValidation.js'
-import type { Options } from '../claude.js'
-import { randomUUID } from 'crypto'
 import { API_ERROR_MESSAGE_PREFIX } from '../errors.js'
+import {
+  isToolSearchEnabled,
+  extractDiscoveredToolNames,
+} from '../../../utils/toolSearch.js'
+import {
+  isDeferredTool,
+  TOOL_SEARCH_TOOL_NAME,
+} from '../../../tools/ToolSearchTool/prompt.js'
 
 type OpenAIMaxTokensParam = 'max_completion_tokens' | 'max_tokens'
 type OpenAIUsage = {
@@ -38,6 +50,45 @@ type OpenAIUsage = {
   output_tokens: number
   cache_creation_input_tokens: number
   cache_read_input_tokens: number
+}
+
+function createMaxOutputTokensErrorMessage(
+  maxOutputTokens: number,
+): AssistantMessage {
+  return {
+    type: 'assistant',
+    requestId: undefined,
+    uuid: randomUUID(),
+    timestamp: new Date().toISOString(),
+    apiError: 'max_output_tokens',
+    error: 'max_output_tokens',
+    isApiErrorMessage: true,
+    message: {
+      id: randomUUID(),
+      container: null,
+      model: '<synthetic>',
+      role: 'assistant',
+      stop_reason: 'stop_sequence',
+      stop_sequence: '',
+      type: 'message',
+      usage: {
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+      } as AssistantMessage['message']['usage'],
+      content: [
+        {
+          type: 'text',
+          text:
+            `${API_ERROR_MESSAGE_PREFIX}: The model response exceeded the ` +
+            `${maxOutputTokens} output token maximum. To configure this behavior, ` +
+            `set the CLAUDE_CODE_MAX_OUTPUT_TOKENS environment variable.`,
+        },
+      ],
+      context_management: null,
+    },
+  }
 }
 
 export function getOpenAIMaxOutputTokens(options: Options): number {
@@ -89,10 +140,7 @@ export function shouldRetryWithAlternateMaxTokensParam(
 
 export async function createOpenAIStream(
   client: ReturnType<typeof getOpenAIClient>,
-  requestBase: Omit<
-    ChatCompletionCreateParamsStreaming,
-    'max_completion_tokens' | 'max_tokens'
-  >,
+  requestBase: Record<string, any>,
   maxOutputTokens: number,
   signal: AbortSignal,
   model: string,
@@ -145,7 +193,7 @@ export function applyOpenAIMessageDelta(params: {
 }): {
   usage: OpenAIUsage
   emittedMaxTokensError: boolean
-  syntheticError?: SystemAPIErrorMessage
+  syntheticError?: AssistantMessage
 } {
   const nextUsage = params.event.usage
     ? { ...params.usage, ...params.event.usage }
@@ -164,20 +212,85 @@ export function applyOpenAIMessageDelta(params: {
     return {
       usage: nextUsage,
       emittedMaxTokensError: true,
-      syntheticError: createAssistantAPIErrorMessage({
-        content:
-          `${API_ERROR_MESSAGE_PREFIX}: The model response exceeded the ` +
-          `${params.maxOutputTokens} output token maximum. To configure this behavior, ` +
-          `set the CLAUDE_CODE_MAX_OUTPUT_TOKENS environment variable.`,
-        apiError: 'max_output_tokens',
-        error: 'max_output_tokens',
-      }),
+      syntheticError: createMaxOutputTokensErrorMessage(
+        params.maxOutputTokens,
+      ),
     }
   }
 
   return {
     usage: nextUsage,
     emittedMaxTokensError: params.emittedMaxTokensError,
+  }
+}
+
+/**
+ * Detect whether DeepSeek-style thinking mode should be enabled.
+ *
+ * Enabled when:
+ * 1. OPENAI_ENABLE_THINKING=1 is set (explicit enable), OR
+ * 2. Model name contains "deepseek-reasoner" OR "DeepSeek-V3.2" (auto-detect, case-insensitive)
+ *
+ * Disabled when:
+ * - OPENAI_ENABLE_THINKING=0/false/no/off is explicitly set (overrides model detection)
+ *
+ * @param model - The resolved OpenAI model name
+ * @internal Exported for testing purposes only
+ */
+export function isOpenAIThinkingEnabled(model: string): boolean {
+  // Explicit disable takes priority (overrides model auto-detect)
+  if (isEnvDefinedFalsy(process.env.OPENAI_ENABLE_THINKING)) return false
+  // Explicit enable
+  if (isEnvTruthy(process.env.OPENAI_ENABLE_THINKING)) return true
+  // Auto-detect from model name (deepseek-reasoner and DeepSeek-V3.2 support thinking mode)
+  const modelLower = model.toLowerCase()
+  return modelLower.includes('deepseek-reasoner') || modelLower.includes('deepseek-v3.2')
+}
+
+/**
+ * Build the request body for OpenAI chat.completions.create().
+ * Extracted for testability — the thinking mode params are injected here.
+ *
+ * DeepSeek thinking mode: inject thinking params via request body.
+ * Two formats are added simultaneously to support different deployments:
+ * - Official DeepSeek API: `thinking: { type: 'enabled' }`
+ * - Self-hosted DeepSeek-V3.2: `enable_thinking: true` + `chat_template_kwargs: { thinking: true }`
+ * OpenAI SDK passes unknown keys through to the HTTP body.
+ * Each endpoint will use the format it recognizes and ignore the others.
+ * @internal Exported for testing purposes only
+ */
+export function buildOpenAIRequestBody(params: {
+  model: string
+  messages: any[]
+  tools: any[]
+  toolChoice: any
+  enableThinking: boolean
+  temperatureOverride?: number
+}): Record<string, any> {
+  const { model, messages, tools, toolChoice, enableThinking, temperatureOverride } = params
+  return {
+    model,
+    messages,
+    ...(tools.length > 0 && {
+      tools,
+      ...(toolChoice && { tool_choice: toolChoice }),
+    }),
+    stream: true,
+    stream_options: { include_usage: true },
+    // DeepSeek thinking mode: enable chain-of-thought output.
+    // When active, temperature/top_p/presence_penalty/frequency_penalty are ignored by DeepSeek.
+    ...(enableThinking && {
+      // Official DeepSeek API format
+      thinking: { type: 'enabled' },
+      // Self-hosted DeepSeek-V3.2 format
+      enable_thinking: true,
+      chat_template_kwargs: { thinking: true },
+    }),
+    // Only send temperature when thinking mode is off (DeepSeek ignores it anyway,
+    // but other providers may respect it)
+    ...(!enableThinking && temperatureOverride !== undefined && {
+      temperature: temperatureOverride,
+    }),
   }
 }
 
@@ -204,19 +317,54 @@ export async function* queryModelOpenAI(
     // 2. Normalize messages using shared preprocessing
     const messagesForAPI = normalizeMessagesForAPI(messages, tools)
 
-    // 3. Build tool schemas
+    // 3. Check if tool search is enabled (similar to Anthropic path)
+    const useToolSearch = await isToolSearchEnabled(
+      options.model,
+      tools,
+      options.getToolPermissionContext ||
+        (async () => getEmptyToolPermissionContext()),
+      options.agents || [],
+      options.querySource,
+    )
+
+    // 4. Build deferred tools set (similar to Anthropic path)
+    const deferredToolNames = new Set<string>()
+    if (useToolSearch) {
+      for (const t of tools) {
+        if (isDeferredTool(t)) deferredToolNames.add(t.name)
+      }
+    }
+
+    // 5. Filter tools (similar to Anthropic path)
+    let filteredTools = tools
+    if (useToolSearch && deferredToolNames.size > 0) {
+      const discoveredToolNames = extractDiscoveredToolNames(messages)
+
+      filteredTools = tools.filter(tool => {
+        // Always include non-deferred tools
+        if (!deferredToolNames.has(tool.name)) return true
+        // Always include ToolSearchTool (so it can discover more tools)
+        if (toolMatchesName(tool, TOOL_SEARCH_TOOL_NAME)) return true
+        // Only include deferred tools that have been discovered
+        return discoveredToolNames.has(tool.name)
+      })
+    }
+
+    // 6. Build tool schemas with deferLoading flag
     const toolSchemas = await Promise.all(
-      tools.map(tool =>
+      filteredTools.map(tool =>
         toolToAPISchema(tool, {
           getToolPermissionContext: options.getToolPermissionContext,
           tools,
           agents: options.agents,
           allowedAgentTypes: options.allowedAgentTypes,
           model: options.model,
+          deferLoading: useToolSearch && deferredToolNames.has(tool.name),
         }),
       ),
     )
-    // Filter out non-standard tools (server tools like advisor)
+
+    // 7. Filter out non-standard tools (server tools like advisor)
     const standardTools = toolSchemas.filter(
       (t): t is BetaToolUnion & { type: string } => {
         const anyT = t as Record<string, unknown>
@@ -226,16 +374,30 @@ export async function* queryModelOpenAI(
       },
     )
 
-    // 4. Convert messages and tools to OpenAI format
-    const openaiMessages = anthropicMessagesToOpenAI(
-      messagesForAPI,
-      systemPrompt,
-    )
+    // 8. Convert messages and tools to OpenAI format
+    const enableThinking = isOpenAIThinkingEnabled(openaiModel)
+    const openaiMessages = anthropicMessagesToOpenAI(messagesForAPI, systemPrompt, {
+      enableThinking,
+    })
     const openaiTools = anthropicToolsToOpenAI(standardTools)
     const openaiToolChoice = anthropicToolChoiceToOpenAI(options.toolChoice)
     const maxOutputTokens = getOpenAIMaxOutputTokens(options)
 
-    // 5. Get client and make streaming request
+    // 9. Log tool filtering details
+    if (useToolSearch) {
+      const includedDeferredTools = filteredTools.filter(t =>
+        deferredToolNames.has(t.name),
+      ).length
+      logForDebugging(
+        `[OpenAI] Tool search enabled: ${includedDeferredTools}/${deferredToolNames.size} deferred tools included, total tools=${openaiTools.length}`,
+      )
+    } else {
+      logForDebugging(
+        `[OpenAI] Tool search disabled, total tools=${openaiTools.length}`,
+      )
+    }
+
+    // 10. Get client and make streaming request
     const client = getOpenAIClient({
       maxRetries: 0,
       fetchOverride: options.fetchOverride,
@@ -243,37 +405,28 @@ export async function* queryModelOpenAI(
     })
 
     logForDebugging(
-      `[OpenAI] Calling model=${openaiModel}, messages=${openaiMessages.length}, tools=${openaiTools.length}`,
+      `[OpenAI] Calling model=${openaiModel}, messages=${openaiMessages.length}, tools=${openaiTools.length}, thinking=${enableThinking}`,
     )
 
-    // 6. Call OpenAI API with streaming
-    const requestBase = {
+    // 11. Call OpenAI API with streaming
+    const requestBody = buildOpenAIRequestBody({
       model: openaiModel,
       messages: openaiMessages,
-      ...(openaiTools.length > 0 && {
-        tools: openaiTools,
-        ...(openaiToolChoice && { tool_choice: openaiToolChoice }),
-      }),
-      stream: true,
-      stream_options: { include_usage: true },
-      ...(options.temperatureOverride !== undefined && {
-        temperature: options.temperatureOverride,
-      }),
-    } as Omit<
-      ChatCompletionCreateParamsStreaming,
-      'max_completion_tokens' | 'max_tokens'
-    >
-
+      tools: openaiTools,
+      toolChoice: openaiToolChoice,
+      enableThinking,
+      temperatureOverride: options.temperatureOverride,
+    })
     const stream = await createOpenAIStream(
       client,
-      requestBase,
+      requestBody,
       maxOutputTokens,
       signal,
       openaiModel,
     )
 
-    // 7. Convert OpenAI stream to Anthropic events, then process into
-    //    AssistantMessage + StreamEvent (matching the Anthropic path behavior)
+    // 12. Convert OpenAI stream to Anthropic events, then process into
+    //     AssistantMessage + StreamEvent (matching the Anthropic path behavior)
     const adaptedStream = adaptOpenAIStreamToAnthropic(stream, openaiModel)
 
     // Accumulate content blocks and usage, same as the Anthropic path in claude.ts

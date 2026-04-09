@@ -145,15 +145,12 @@ function extractOpenAIResponseText(content: unknown): string {
       if (!part || typeof part !== 'object') {
         return ''
       }
-
       if ('text' in part && typeof part.text === 'string') {
         return part.text
       }
-
       if ('refusal' in part && typeof part.refusal === 'string') {
         return part.refusal
       }
-
       return ''
     })
     .filter(Boolean)
@@ -332,7 +329,6 @@ export async function sideQuery(opts: SideQueryOptions): Promise<BetaMessage> {
   const provider = getAPIProvider()
   const normalizedModel = normalizeModelStringForAPI(model)
   const start = Date.now()
-
   const response =
     provider === 'openai' || provider === 'grok'
       ? await sideQueryViaOpenAICompatibleProvider(opts, provider)
@@ -343,7 +339,6 @@ export async function sideQuery(opts: SideQueryOptions): Promise<BetaMessage> {
             source: 'side_query',
           })
           const betas = [...getModelBetas(model)]
-          // Add structured-outputs beta if using output_format and provider supports it
           if (
             output_format &&
             modelSupportsStructuredOutputs(model) &&
@@ -352,22 +347,12 @@ export async function sideQuery(opts: SideQueryOptions): Promise<BetaMessage> {
             betas.push(STRUCTURED_OUTPUTS_BETA_HEADER)
           }
 
-          // Extract first user message text for fingerprint computation.
-          // This stays first-party only: OpenAI-compatible providers should not
-          // see Anthropic attribution headers in their prompt text.
           const messageText = extractFirstUserMessageText(messages)
-
-          // Compute fingerprint for OAuth attribution
           const fingerprint = computeFingerprint(messageText, MACRO.VERSION)
           const attributionHeader = getAttributionHeader(fingerprint)
 
-          // Build system as array to keep attribution header in its own block
-          // (prevents server-side parsing from including system content in cc_entrypoint)
           const systemBlocks: TextBlockParam[] = [
-            attributionHeader
-              ? { type: 'text', text: attributionHeader }
-              : null,
-            // Skip CLI system prompt prefix for internal classifiers that provide their own prompt
+            attributionHeader ? { type: 'text', text: attributionHeader } : null,
             ...(skipSystemPromptPrefix
               ? []
               : [
@@ -405,9 +390,7 @@ export async function sideQuery(opts: SideQueryOptions): Promise<BetaMessage> {
               messages,
               ...(tools && { tools }),
               ...(tool_choice && { tool_choice }),
-              ...(output_format && {
-                output_config: { format: output_format },
-              }),
+              ...(output_format && { output_config: { format: output_format } }),
               ...(temperature !== undefined && { temperature }),
               ...(stop_sequences && { stop_sequences }),
               ...(thinkingConfig && { thinking: thinkingConfig }),

@@ -109,10 +109,9 @@ export function getFastModeUnavailableReason(): string | null {
     }
   }
 
-  // Only available for Anthropic first-party sessions.
+  // Only available for 1P (not Bedrock/Vertex/Foundry)
   if (getAPIProvider() !== 'firstParty') {
-    const reason =
-      'Fast mode is not available on OpenAI-compatible, Gemini, Grok, Bedrock, Vertex, or Foundry providers'
+    const reason = 'Fast mode is not available on Bedrock, Vertex, or Foundry'
     logForDebugging(`Fast mode unavailable: ${reason}`)
     return reason
   }

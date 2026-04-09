@@ -11,7 +11,7 @@ export type ReservedShortcut = {
 }
 
 /**
- * Shortcuts that cannot be rebound - they are hardcoded in Rain Code.
+ * Shortcuts that cannot be rebound - they are hardcoded in Claude Code.
  */
 export const NON_REBINDABLE: ReservedShortcut[] = [
   {

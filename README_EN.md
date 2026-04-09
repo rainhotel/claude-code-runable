@@ -1,4 +1,4 @@
-# Rain Code
+# Claude Code Best V5 (CCB)
 
 [![GitHub Stars](https://img.shields.io/github/stars/claude-code-best/claude-code?style=flat-square&logo=github&color=yellow)](https://github.com/claude-code-best/claude-code/stargazers)
 [![GitHub Contributors](https://img.shields.io/github/contributors/claude-code-best/claude-code?style=flat-square&color=green)](https://github.com/claude-code-best/claude-code/graphs/contributors)
@@ -7,9 +7,9 @@
 [![Last Commit](https://img.shields.io/github/last-commit/claude-code-best/claude-code?style=flat-square&color=blue)](https://github.com/claude-code-best/claude-code/commits/main)
 [![Bun](https://img.shields.io/badge/runtime-Bun-black?style=flat-square&logo=bun)](https://bun.sh/)
 
-> Rain Code is the branded distribution of this reverse-engineered CLI project.
+> Which Claude do you like? The open source one is the best.
 
-Rain Code is a reverse-engineered / decompiled source restoration of Anthropic's official [Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI tool. The goal is to reproduce most of Claude Code's functionality and engineering capabilities.
+A reverse-engineered / decompiled source restoration of Anthropic's official [Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI tool. The goal is to reproduce most of Claude Code's functionality and engineering capabilities. It's abbreviated as CCB.
 
 [Documentation (Chinese)](https://ccb.agent-aura.top/) — PR contributions welcome.
 
@@ -48,7 +48,7 @@ Sponsor placeholder.
 Make sure you're on the latest version of Bun, otherwise you'll run into all sorts of weird bugs. Run `bun upgrade`!
 
 - [Bun](https://bun.sh/) >= 1.3.11
-- Standard Rain Code configuration — each provider has its own setup method
+- Standard Claude Code configuration — each provider has its own setup method
 
 ### Install
 
@@ -59,7 +59,7 @@ bun install
 ### Run
 
 ```bash
-# Dev mode — if you see version 1.0.2, it's working
+# Dev mode — if you see version 888, it's working
 bun run dev
 
 # Build

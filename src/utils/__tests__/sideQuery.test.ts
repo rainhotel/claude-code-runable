@@ -1,24 +1,5 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
 
-const getLastApiCompletionTimestamp = mock(() => null)
-const setLastApiCompletionTimestamp = mock(() => {})
-const logEvent = mock(() => {})
-const anthropicMessagesToOpenAI = mock(() => [
-  { role: 'system', content: 'converted-system' },
-])
-const anthropicToolsToOpenAI = mock(() => [
-  {
-    type: 'function',
-    function: {
-      name: 'explain_command',
-      parameters: { type: 'object' },
-    },
-  },
-])
-const anthropicToolChoiceToOpenAI = mock(() => ({
-  type: 'function',
-  function: { name: 'explain_command' },
-}))
 const openAICreate = mock(async () => ({
   id: 'resp_123',
   model: 'gpt-5.4',
@@ -53,111 +34,22 @@ const getOpenAIClient = mock(() => ({
     },
   },
 }))
-const getAnthropicClient = mock(async () => {
-  throw new Error('Anthropic client should not be used for OpenAI sideQuery')
-})
-
-mock.module('../../bootstrap/state.js', () => ({
-  getLastApiCompletionTimestamp,
-  setLastApiCompletionTimestamp,
-}))
-
-mock.module('../../services/analytics/index.js', () => ({
-  logEvent,
-}))
-
-mock.module('../../constants/betas.js', () => ({
-  STRUCTURED_OUTPUTS_BETA_HEADER: 'structured-outputs',
-}))
-
-mock.module('../../constants/system.js', () => ({
-  getAttributionHeader: () => '',
-  getCLISyspromptPrefix: () => '',
-}))
-
-mock.module('../../services/api/claude.js', () => ({
-  getAPIMetadata: () => ({}),
-}))
-
-mock.module('../settings/settings.js', () => ({
-  getInitialSettings: () => ({}),
-}))
-
-mock.module('../../services/api/client.js', () => ({
-  getAnthropicClient,
-}))
 
 mock.module('../../services/api/openai/client.js', () => ({
   getOpenAIClient,
-}))
-
-mock.module('../../services/api/openai/modelMapping.js', () => ({
-  resolveOpenAIModel: () => 'gpt-5.4',
-}))
-
-mock.module('../../services/api/openai/convertMessages.js', () => ({
-  anthropicMessagesToOpenAI,
-}))
-
-mock.module('../../services/api/openai/convertTools.js', () => ({
-  anthropicToolsToOpenAI,
-  anthropicToolChoiceToOpenAI,
-}))
-
-mock.module('../messages.js', () => ({
-  createAssistantMessage: ({ content }: { content: unknown }) => ({
-    type: 'assistant',
-    message: { content },
-  }),
-  createUserMessage: ({ content }: { content: unknown }) => ({
-    type: 'user',
-    message: { content },
-  }),
-}))
-
-mock.module('../../services/api/grok/client.js', () => ({
-  getGrokClient: () => {
-    throw new Error('Grok client should not be used in this test')
-  },
-}))
-
-mock.module('../../services/api/grok/modelMapping.js', () => ({
-  resolveGrokModel: () => 'grok-1',
-}))
-
-mock.module('../betas.js', () => ({
-  getModelBetas: () => [],
-  modelSupportsStructuredOutputs: () => true,
-}))
-
-mock.module('../fingerprint.js', () => ({
-  computeFingerprint: () => 'fingerprint',
-}))
-
-mock.module('../json.js', () => ({
-  safeParseJSON: (value: string) => JSON.parse(value),
-}))
-
-mock.module('../model/model.js', () => ({
-  normalizeModelStringForAPI: (model: string) => model,
 }))
 
 const { sideQuery } = await import('../sideQuery.js')
 
 describe('sideQuery', () => {
   const originalOpenAIFlag = process.env.CLAUDE_CODE_USE_OPENAI
+  const originalOpenAIModel = process.env.OPENAI_MODEL
 
   beforeEach(() => {
     process.env.CLAUDE_CODE_USE_OPENAI = '1'
-    getLastApiCompletionTimestamp.mockClear()
-    setLastApiCompletionTimestamp.mockClear()
-    logEvent.mockClear()
-    anthropicMessagesToOpenAI.mockClear()
-    anthropicToolsToOpenAI.mockClear()
-    anthropicToolChoiceToOpenAI.mockClear()
+    process.env.OPENAI_MODEL = 'gpt-5.4'
     openAICreate.mockClear()
     getOpenAIClient.mockClear()
-    getAnthropicClient.mockClear()
   })
 
   afterEach(() => {
@@ -166,6 +58,12 @@ describe('sideQuery', () => {
     } else {
       delete process.env.CLAUDE_CODE_USE_OPENAI
     }
+    if (originalOpenAIModel !== undefined) {
+      process.env.OPENAI_MODEL = originalOpenAIModel
+    } else {
+      delete process.env.OPENAI_MODEL
+    }
+    mock.restore()
   })
 
   test('routes OpenAI side queries through the OpenAI-compatible client', async () => {
@@ -196,15 +94,32 @@ describe('sideQuery', () => {
     })
 
     expect(getOpenAIClient).toHaveBeenCalledTimes(1)
-    expect(getAnthropicClient).not.toHaveBeenCalled()
-
-    expect(anthropicMessagesToOpenAI).toHaveBeenCalledTimes(1)
-    const [, systemPrompt] = anthropicMessagesToOpenAI.mock.calls[0]!
-    expect([...systemPrompt]).toEqual(['Explain the command safely'])
 
     expect(openAICreate).toHaveBeenCalledTimes(1)
     const [params] = openAICreate.mock.calls[0]!
     expect(params.model).toBe('gpt-5.4')
+    expect(params.messages[0]).toEqual({
+      role: 'system',
+      content: 'Explain the command safely',
+    })
+    expect(params.messages[1]).toEqual({
+      role: 'user',
+      content: 'Explain rm -rf build/',
+    })
+    expect(params.tools).toEqual([
+      {
+        type: 'function',
+        function: {
+          name: 'explain_command',
+          description: 'Explain a command',
+          parameters: { type: 'object' },
+        },
+      },
+    ])
+    expect(params.tool_choice).toEqual({
+      type: 'function',
+      function: { name: 'explain_command' },
+    })
     expect(params.max_completion_tokens).toBe(256)
     expect(params.stop).toEqual(['</block>'])
     expect(params.response_format).toEqual({
